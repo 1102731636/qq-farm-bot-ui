@@ -5,7 +5,7 @@
 const protobuf = require('protobufjs');
 const { CONFIG, PlantPhase, PHASE_NAMES } = require('../config/config');
 const { getPlantNameBySeedId, getPlantName, getPlantExp, formatGrowTime, getPlantGrowTime, getAllSeeds, getPlantById, getPlantBySeedId, getSeedImageBySeedId } = require('../config/gameConfig');
-const { isAutomationOn, getPreferredSeed, getAutomation, getPlantingStrategy } = require('../models/store');
+const { isAutomationOn, getPreferredSeed, getAutomation, getPlantingStrategy, getBagSeedPriority, setPlantingStrategy } = require('../models/store');
 const { sendMsgAsync, getUserState, networkEvents, getWsErrorState } = require('../utils/network');
 const { types } = require('../utils/proto');
 const { toLong, toNum, getServerTimeSec, toTimeSec, log, logWarn, sleep } = require('../utils/utils');
@@ -834,14 +834,287 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds) {
             logWarn('铲除', `批量铲除失败: ${e.message}`, {
                 module: 'farm', event: 'remove_plant', result: 'error'
             });
-            // 失败时仍然尝试种植
             landsToPlant.push(...deadLandIds);
         }
     }
 
     if (landsToPlant.length === 0) return;
 
-    // 2. 查询种子商店
+    const strategy = getPlantingStrategy();
+    log('种植', `当前种植策略: ${strategy}`, {
+        module: 'farm', event: 'plant_strategy', strategy
+    });
+
+    // 2. 背包种子优先模式
+    if (strategy === 'bag_priority') {
+        const planted = await plantFromBagSeeds(landsToPlant);
+        if (planted) return;
+        // 背包种子用完或空地不足，继续检查是否需要切换策略
+    }
+
+    // 3. 非背包优先模式，或背包种子已用完，从商店购买
+    await plantFromShop(landsToPlant, state);
+}
+
+/**
+ * 从背包种子种植
+ * @returns {boolean} true=已种植或等待中，false=需要从商店购买
+ */
+async function plantFromBagSeeds(landsToPlant) {
+    const { getBagSeeds } = require('./warehouse');
+
+    let bagSeeds;
+    try {
+        bagSeeds = await getBagSeeds();
+        log('背包', `获取到 ${bagSeeds.length} 种种子: ${bagSeeds.map(s => `${s.name}x${s.count}`).join(', ') || '无'}`, {
+            module: 'farm', event: 'bag_seeds_fetch', count: bagSeeds.length
+        });
+    } catch (e) {
+        logWarn('背包', `获取背包种子失败: ${e.message}`);
+        return false;
+    }
+
+    if (!bagSeeds || bagSeeds.length === 0) {
+        log('种植', '背包无种子，自动切换为最高等级策略', {
+            module: 'farm', event: 'bag_empty', result: 'switch_strategy'
+        });
+        setPlantingStrategy(undefined, 'level');
+        return false;
+    }
+
+    // 按用户设置的优先级排序
+    const priority = getBagSeedPriority();
+    log('背包', `用户优先级设置: ${priority.length > 0 ? priority.join(',') : '无(按等级排序)'}`, {
+        module: 'farm', event: 'bag_priority', priority
+    });
+    const sortedSeeds = sortBagSeedsByPriority(bagSeeds, priority);
+
+    // 按用户优先级遍历种子，检查是否有连续地块可种植
+    let availableSeed = null;
+    let plantSize = 1;
+    let contiguousGroups = [];
+
+    for (const seed of sortedSeeds) {
+        if (seed.count <= 0) continue;
+        const size = seed.plantSize || 1;
+
+        if (size > 1) {
+            // 大尺寸种子需要检测连续地块
+            const groups = findContiguousLandGroups(landsToPlant, size);
+            if (groups.length > 0) {
+                availableSeed = seed;
+                plantSize = size;
+                contiguousGroups = groups;
+                log('种植', `${seed.name} 是 ${size}x${size} 种子，找到 ${groups.length} 组连续地块`, {
+                    module: 'farm', event: 'bag_seed_contiguous', seedId: seed.seedId, size, groups: groups.length
+                });
+                break;
+            } else {
+                log('种植', `${seed.name} 是 ${size}x${size} 种子，无连续 ${size}x${size} 空地，跳过`, {
+                    module: 'farm', event: 'bag_seed_no_contiguous', seedId: seed.seedId, size
+                });
+                continue;
+            }
+        } else {
+            // 1x1 种子直接使用
+            if (landsToPlant.length > 0) {
+                availableSeed = seed;
+                plantSize = 1;
+                contiguousGroups = landsToPlant.map(id => [id]);
+                break;
+            }
+        }
+    }
+
+    if (!availableSeed) {
+        // 检查是否所有种子都用完了
+        const hasAnySeeds = sortedSeeds.some(s => s.count > 0);
+        if (!hasAnySeeds) {
+            log('种植', '背包种子已用完，自动切换为最高等级策略', {
+                module: 'farm', event: 'bag_seeds_exhausted', result: 'switch_strategy'
+            });
+            setPlantingStrategy(undefined, 'level');
+            return false;
+        }
+        // 有种子但无法种植（可能是大尺寸种子但没有连续空地）
+        log('种植', '背包有种子但无合适空地，等待更多空地', {
+            module: 'farm', event: 'bag_seed_wait_land', result: 'wait'
+        });
+        return true; // 等待
+    }
+
+    // 计算能种多少
+    let needCount = Math.min(contiguousGroups.length, availableSeed.count);
+
+    if (needCount <= 0) {
+        return true; // 等待
+    }
+
+    // 种植背包种子
+    let plantedLands = [];
+    let totalPlanted = 0;
+
+    if (plantSize > 1) {
+        // 大尺寸种子：逐组种植，每组只种植左上角的地块
+        for (let i = 0; i < needCount; i++) {
+            const group = contiguousGroups[i];
+            // 找到左上角的地块（ID 最小的）
+            const topLeftLandId = Math.min(...group);
+            try {
+                const { planted, plantedLandIds } = await plantSeeds(
+                    availableSeed.seedId,
+                    [topLeftLandId],
+                    { maxPlantCount: 1 }
+                );
+                if (planted > 0) {
+                    totalPlanted++;
+                    plantedLands.push(...plantedLandIds);
+                }
+            } catch (e) {
+                logWarn('种植', `土地#${topLeftLandId} 种植失败: ${e.message}`);
+            }
+        }
+    } else {
+        // 1x1 种子：批量种植
+        const landsToUse = contiguousGroups.slice(0, needCount).map(g => g[0]);
+        try {
+            const { planted, plantedLandIds } = await plantSeeds(
+                availableSeed.seedId,
+                landsToUse,
+                { maxPlantCount: needCount }
+            );
+            totalPlanted = planted;
+            plantedLands = plantedLandIds;
+        } catch (e) {
+            logWarn('种植', `背包种子种植失败: ${e.message}`);
+            return false;
+        }
+    }
+
+    const isEvent = availableSeed.requiredLevel >= 200;
+    const seedLabel = isEvent ? `[活动] ${availableSeed.name}` : availableSeed.name;
+    log('种植', plantSize > 1
+        ? `使用背包种子 ${seedLabel} 种植 ${totalPlanted} 组 ${plantSize}x${plantSize}，占用 ${totalPlanted * plantSize * plantSize} 块地`
+        : `使用背包种子 ${seedLabel} 种植 ${totalPlanted} 块地`, {
+        module: 'farm',
+        event: 'bag_seed_plant',
+        result: 'ok',
+        seedId: availableSeed.seedId,
+        count: totalPlanted,
+        plantSize,
+        isEvent,
+    });
+
+    if (totalPlanted > 0) {
+        recordOperation('plant', totalPlanted);
+    }
+
+    // 施肥
+    await runFertilizerByConfig(plantedLands);
+    return true;
+}
+
+/**
+ * 按优先级排序背包种子
+ */
+function sortBagSeedsByPriority(bagSeeds, priority) {
+    if (!priority || priority.length === 0) {
+        // 无优先级设置，按等级降序
+        return [...bagSeeds].sort((a, b) => b.requiredLevel - a.requiredLevel);
+    }
+
+    const priorityMap = new Map();
+    priority.forEach((seedId, index) => {
+        priorityMap.set(seedId, index);
+    });
+
+    return [...bagSeeds].sort((a, b) => {
+        const pa = priorityMap.has(a.seedId) ? priorityMap.get(a.seedId) : Number.MAX_SAFE_INTEGER;
+        const pb = priorityMap.has(b.seedId) ? priorityMap.get(b.seedId) : Number.MAX_SAFE_INTEGER;
+        if (pa !== pb) return pa - pb;
+        // 优先级相同时按等级降序
+        return b.requiredLevel - a.requiredLevel;
+    });
+}
+
+/**
+ * 农场布局常量
+ * 农场是 6 列 4 行的网格，土地 ID 按列排列：
+ * 列1: 1,2,3,4  列2: 5,6,7,8  列3: 9,10,11,12  列4: 13,14,15,16  列5: 17,18,19,20  列6: 21,22,23,24
+ * 
+ * 网格视图（行x列）：
+ *   col0  col1  col2  col3  col4  col5
+ * row0:  1     5     9    13    17    21
+ * row1:  2     6    10    14    18    22
+ * row2:  3     7    11    15    19    23
+ * row3:  4     8    12    16    20    24
+ */
+const FARM_ROWS = 4;
+const FARM_COLS = 6;
+
+function landIdToPosition(landId) {
+    const id = toNum(landId);
+    if (id < 1 || id > FARM_ROWS * FARM_COLS) return null;
+    const col = Math.floor((id - 1) / FARM_ROWS);
+    const row = (id - 1) % FARM_ROWS;
+    return { row, col };
+}
+
+function positionToLandId(row, col) {
+    if (row < 0 || row >= FARM_ROWS || col < 0 || col >= FARM_COLS) return null;
+    return col * FARM_ROWS + row + 1;
+}
+
+/**
+ * 查找可以种植 size x size 作物的连续地块组
+ * @param {number[]} emptyLandIds - 空地 ID 列表
+ * @param {number} size - 作物尺寸 (2 表示 2x2)
+ * @returns {number[][]} - 可种植的地块组列表，每组包含 size*size 个连续地块 ID
+ */
+function findContiguousLandGroups(emptyLandIds, size) {
+    if (size <= 1) {
+        return emptyLandIds.map(id => [id]);
+    }
+
+    const emptySet = new Set(emptyLandIds.map(id => toNum(id)));
+    const groups = [];
+    const usedLands = new Set();
+
+    // 遍历所有可能的左上角位置
+    for (let row = 0; row <= FARM_ROWS - size; row++) {
+        for (let col = 0; col <= FARM_COLS - size; col++) {
+            const groupLands = [];
+            let isValid = true;
+
+            // 检查 size x size 区域内的所有地块
+            for (let dr = 0; dr < size && isValid; dr++) {
+                for (let dc = 0; dc < size && isValid; dc++) {
+                    const landId = positionToLandId(row + dr, col + dc);
+                    if (!landId || !emptySet.has(landId) || usedLands.has(landId)) {
+                        isValid = false;
+                    } else {
+                        groupLands.push(landId);
+                    }
+                }
+            }
+
+            if (isValid && groupLands.length === size * size) {
+                groups.push(groupLands);
+                // 标记这些地块已被使用
+                for (const id of groupLands) {
+                    usedLands.add(id);
+                }
+            }
+        }
+    }
+
+    return groups;
+}
+
+/**
+ * 从商店购买种子并种植
+ */
+async function plantFromShop(landsToPlant, state) {
     let bestSeed;
     try {
         bestSeed = await findBestSeed();
@@ -852,7 +1125,7 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds) {
     if (!bestSeed) return;
 
     const seedName = getPlantNameBySeedId(bestSeed.seedId);
-    const growTime = getPlantGrowTime(1020000 + (bestSeed.seedId - 20000));  // 转换为植物ID
+    const growTime = getPlantGrowTime(1020000 + (bestSeed.seedId - 20000));
     const growTimeStr = growTime > 0 ? ` 生长${formatGrowTime(growTime)}` : '';
     const plantSize = getPlantSizeBySeedId(bestSeed.seedId);
     const landFootprint = plantSize * plantSize;
@@ -860,7 +1133,6 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds) {
         module: 'warehouse', event: 'seed_pick', seedId: bestSeed.seedId, price: bestSeed.price
     });
 
-    // 3. 购买
     let needCount = landsToPlant.length;
     if (landFootprint > 1) {
         needCount = Math.floor(landsToPlant.length / landFootprint);
@@ -914,7 +1186,6 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds) {
         return;
     }
 
-    // 4. 种植（逐块拖动，间隔50ms）
     let plantedLands = [];
     try {
         const { planted, plantedLandIds, occupiedLandIds } = await plantSeeds(actualSeedId, landsToPlant, { maxPlantCount: needCount });
@@ -931,12 +1202,12 @@ async function autoPlantEmptyLands(deadLandIds, emptyLandIds) {
         });
         if (planted > 0) {
             plantedLands = plantedLandIds;
+            recordOperation('plant', planted);
         }
     } catch (e) {
         logWarn('种植', e.message);
     }
 
-    // 5. 施肥
     await runFertilizerByConfig(plantedLands);
 }
 
